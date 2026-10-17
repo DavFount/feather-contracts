@@ -20,14 +20,10 @@ local function Boundary(label, operation, ...)
     return result
 end
 
--- Debtor actions through a server consumer must name the acting player.
+-- Debtor actions: a character debtor is named by context.actorSource; an
+-- organization debtor acts as the calling resource (its treasury operator).
 local function DebtorContext(context, resource)
-    local built = ContractsObligations.ServerContext(resource, context)
-    if not built.ok then return built end
-    if built.value.actorSource == nil then
-        return Err('invalid_input', 'context.actorSource is required for debtor actions.')
-    end
-    return built
+    return ContractsObligations.ServerContext(resource, context)
 end
 
 function ContractsAPI.GetCapabilities() return ContractsFoundation.GetCapabilities() end

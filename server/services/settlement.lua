@@ -201,7 +201,19 @@ function ContractsSettlement.SettleObligation(request, context, resource, viaCli
     if not current.ok then return current end
     current = current.value
     local initiatedBy
-    if viaClient then
+    if current.debtor.type == 'organization' then
+        -- Only the resource operating the debtor's treasury pays from it; Economy
+        -- enforces the same binding on the transfer.
+        if viaClient then return Err('obligation_not_found', 'Obligation was not found.') end
+        if ContractsEconomy.TreasuryOperator(current.debtor.id, current.currency) ~= resource then
+            return Err('settlement_not_allowed',
+                'Only the resource operating the debtor treasury may pay this obligation.')
+        end
+        if not current.debtorMaySettle then
+            return Err('settlement_not_allowed', 'This obligation cannot be paid directly by the debtor.')
+        end
+        initiatedBy = 'debtor'
+    elseif viaClient then
         if context.actorCharacterId ~= current.debtor.id then
             return Err('obligation_not_found', 'Obligation was not found.')
         end
@@ -223,9 +235,9 @@ function ContractsSettlement.SettleObligation(request, context, resource, viaCli
                 'Settlement requires the debtor as actor, or an obligation type that allows issuer settlement.')
         end
     end
-    local wallet = ContractsEconomy.ResolveDebtorWallet(current.debtor.id, current.currency)
+    local wallet = ContractsEconomy.ResolveDebtorAccount(current.debtor, current.currency)
     if not wallet.ok then
-        return Err('debtor_account_unavailable', 'The debtor has no open wallet in that currency.', {
+        return Err('debtor_account_unavailable', 'The debtor has no open account in that currency.', {
             code = wallet.code
         })
     end

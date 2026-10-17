@@ -190,8 +190,12 @@ function ContractsObligations.CreateDraft(request, context, resource)
 
     local issuer = Party(request.issuer, definition.issuerTypes, 'issuer')
     if not issuer.ok then return issuer end
-    local debtor = Party(request.debtor, { 'character' }, 'debtor')
+    -- Types registered before debtorTypes existed accept character debtors only.
+    local debtor = Party(request.debtor, definition.debtorTypes or { 'character' }, 'debtor')
     if not debtor.ok then return debtor end
+    if Config.Settlement.debtorTypes[debtor.value.type] ~= true then
+        return Err('debtor_type_unsupported', 'This installation cannot settle obligations from that debtor type.')
+    end
     local creditor = Party(request.creditor, definition.creditorTypes, 'creditor')
     if not creditor.ok then return creditor end
     if Config.Settlement.creditorTypes[creditor.value.type] ~= true then
@@ -326,9 +330,9 @@ function ContractsObligations.IssueObligation(request, context, resource)
                 code = creditorAccount.code
             })
         end
-        local debtorWallet = ContractsEconomy.ResolveDebtorWallet(current.debtor.id, current.currency)
+        local debtorWallet = ContractsEconomy.ResolveDebtorAccount(current.debtor, current.currency)
         if not debtorWallet.ok then
-            return Err('debtor_account_unavailable', 'The debtor has no open wallet in that currency.', {
+            return Err('debtor_account_unavailable', 'The debtor has no open account in that currency.', {
                 code = debtorWallet.code
             })
         end
@@ -374,7 +378,16 @@ end
 
 -- Debtor actions (accept, dispute) require the acting character to be the
 -- debtor. Server callers prove that with actorSource; client routes with the session.
+-- A character debtor acts as the actor (Core session); an organization debtor
+-- acts through the resource its treasury is bound to.
 local function RequireDebtor(row, context)
+    if row.debtor.type == 'organization' then
+        local operator = ContractsEconomy.TreasuryOperator(row.debtor.id, row.currency)
+        if operator == nil or operator ~= context.resource then
+            return Err('authorization_denied', 'Only the resource operating the debtor treasury may act for it.')
+        end
+        return Ok(true)
+    end
     if row.debtor.type ~= 'character' or context.actorCharacterId == nil
         or context.actorCharacterId ~= row.debtor.id then
         return Err('authorization_denied', 'Only the debtor may perform this action.')
@@ -388,6 +401,17 @@ local function RequireTypeOwnerOrClient(row, resource, viaClient)
         return Err('authorization_denied', 'Only the owning resource may act on this obligation.')
     end
     return Ok(true)
+end
+
+-- A character debtor acts through the type owner or a client route. An
+-- organization debtor acts through the resource operating its treasury, which
+-- RequireDebtor checks; client routes never act for an organization.
+local function RequireDebtorCaller(row, resource, viaClient)
+    if row.debtor.type == 'organization' then
+        if viaClient then return Err('authorization_denied', 'Only the debtor may perform this action.') end
+        return Ok(true)
+    end
+    return RequireTypeOwnerOrClient(row, resource, viaClient)
 end
 
 function ContractsObligations.AcceptObligation(request, context, resource, viaClient)
@@ -411,7 +435,7 @@ function ContractsObligations.AcceptObligation(request, context, resource, viaCl
         context = context,
         view = context.view,
         check = function(row)
-            local owner = RequireTypeOwnerOrClient(row, resource, viaClient)
+            local owner = RequireDebtorCaller(row, resource, viaClient)
             if not owner.ok then return owner end
             return RequireDebtor(row, context)
         end,
@@ -446,7 +470,7 @@ function ContractsObligations.DisputeObligation(request, context, resource, viaC
         context = context,
         view = context.view,
         check = function(row)
-            local owner = RequireTypeOwnerOrClient(row, resource, viaClient)
+            local owner = RequireDebtorCaller(row, resource, viaClient)
             if not owner.ok then return owner end
             return RequireDebtor(row, context)
         end,
@@ -676,9 +700,13 @@ function ContractsObligations.ListPartyObligations(request, resource)
     if not options.ok then return options end
     options = options.value
     if Config.Access.trustedReaders[resource] ~= true then
-        -- Type owners may list only their own obligation types.
-        if not options.obligationType or ContractsTypes.Owner(options.obligationType) ~= resource then
-            return Err('authorization_denied', 'Callers outside trustedReaders must list an obligationType they own.')
+        -- Type owners may list only their own obligation types; the resource
+        -- operating an organization's treasury may list that organization's.
+        local operates = options.partyType == 'organization'
+            and ContractsEconomy.OrganizationOperator(options.partyId) == resource
+        if not operates and (not options.obligationType or ContractsTypes.Owner(options.obligationType) ~= resource) then
+            return Err('authorization_denied',
+                'Callers outside trustedReaders must list an obligationType they own, or an organization they operate.')
         end
     end
     return Repo.ListParty(options)

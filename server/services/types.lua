@@ -9,10 +9,12 @@ local logger = ContractsLogging.Create('types')
 local persisted, active = {}, {}
 
 local partyTypes = { character = true, organization = true, system = true }
+-- An organization debtor pays from its treasury, through the resource operating it.
+local debtorPartyTypes = { character = true, organization = true }
 local definitionFields = {
     typeKey = true, label = true, requiresAcceptance = true, debtorMaySettle = true,
     issuerMaySettle = true, debtorMayDispute = true, issuerTypes = true,
-    creditorTypes = true, currencies = true, minimumAmount = true, maximumAmount = true,
+    creditorTypes = true, debtorTypes = true, currencies = true, minimumAmount = true, maximumAmount = true,
     maximumDueSeconds = true, defaultAfterSeconds = true
 }
 
@@ -52,6 +54,14 @@ function ContractsTypes.Normalize(definition)
     end
     local issuerTypes = PartyList(definition.issuerTypes, partyTypes, 'issuerTypes')
     if not issuerTypes.ok then return issuerTypes end
+    local debtorTypes = PartyList(definition.debtorTypes or { 'character' }, debtorPartyTypes, 'debtorTypes')
+    if not debtorTypes.ok then return debtorTypes end
+    for _, debtorType in ipairs(debtorTypes.value) do
+        if Config.Settlement.debtorTypes[debtorType] ~= true then
+            return Err('debtor_type_unsupported',
+                'A listed debtor type cannot be settled by this installation.', { debtorType = debtorType })
+        end
+    end
     local creditorTypes = PartyList(definition.creditorTypes, partyTypes, 'creditorTypes')
     if not creditorTypes.ok then return creditorTypes end
     for _, creditorType in ipairs(creditorTypes.value) do
@@ -100,6 +110,7 @@ function ContractsTypes.Normalize(definition)
         issuerMaySettle = Flag(definition.issuerMaySettle, false),
         debtorMayDispute = Flag(definition.debtorMayDispute, false),
         issuerTypes = issuerTypes.value,
+        debtorTypes = debtorTypes.value,
         creditorTypes = creditorTypes.value,
         currencies = currencies,
         minimumAmount = minimumAmount,
