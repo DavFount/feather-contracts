@@ -108,6 +108,14 @@ local function ValidateConfig()
             return ContractsResults.Err('invalid_config', 'Config.Settlement.creditorTypes is invalid.')
         end
     end
+    if type(settlement.debtorTypes) ~= 'table' or settlement.debtorTypes.character ~= true then
+        return ContractsResults.Err('invalid_config', 'Config.Settlement.debtorTypes must enable character.')
+    end
+    for key, enabled in pairs(settlement.debtorTypes) do
+        if (key ~= 'character' and key ~= 'organization') or type(enabled) ~= 'boolean' then
+            return ContractsResults.Err('invalid_config', 'Config.Settlement.debtorTypes is invalid.')
+        end
+    end
     local scheduler = Config.Scheduler
     if type(scheduler) ~= 'table' or not Integer(scheduler.intervalMs, 1000, 600000)
         or not Integer(scheduler.batchSize, 1, 200) then
@@ -168,8 +176,11 @@ function ContractsFoundation.BeginStartup()
     if not core.ok then return ContractsFoundation.MarkFailed(core.code, core.message, core.details) end
 
     SetState('waiting', 'waiting_for_economy')
-    local economy = AwaitDependency('feather-economy', Config.RequiredEconomyContract,
-        { 'currencyCatalog', 'accounts', 'transfers', 'idempotency' })
+    local economyFeatures = { 'currencyCatalog', 'accounts', 'transfers', 'idempotency' }
+    if Config.Settlement.creditorTypes.organization == true or Config.Settlement.debtorTypes.organization == true then
+        economyFeatures[#economyFeatures + 1] = 'organizationSettlement'
+    end
+    local economy = AwaitDependency('feather-economy', Config.RequiredEconomyContract, economyFeatures)
     if not economy.ok then return ContractsFoundation.MarkFailed(economy.code, economy.message, economy.details) end
 
     for key, name in pairs(ContractsFoundation.Events) do
@@ -257,7 +268,7 @@ function ContractsFoundation.GetCapabilities()
             clientRoutes = Config.ClientRoutes.enabled and 1 or 0,
             amendments = 0,
             organizationCreditors = Config.Settlement.creditorTypes.organization == true and 1 or 0,
-            organizationDebtors = 0
+            organizationDebtors = Config.Settlement.debtorTypes.organization == true and 1 or 0
         }
     })
 end

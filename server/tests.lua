@@ -31,7 +31,7 @@ RegisterCommand('ContractsFoundationSmokeTest', function(source)
         and health.checks['feather-economy'] ~= nil and health.checks.events ~= nil)
     t.Check('migration ledger', tonumber(DB.value(
         "SELECT COUNT(*) FROM `contract_schema_migrations` WHERE `id` IN ('001_contracts_foundation',"
-            .. "'002_settlement_economy_check')")) == 2)
+            .. "'002_settlement_economy_check','003_organization_debtors')")) == 3)
 
     local accepted = ContractsTypes.Transitions(true, true)
     local direct = ContractsTypes.Transitions(false, false)
@@ -56,11 +56,13 @@ RegisterCommand('ContractsFoundationSmokeTest', function(source)
     local unsettleable = ContractsTypes.Normalize({ typeKey = 'smoke_type', label = 'x', issuerTypes = { 'system' },
         creditorTypes = { 'system' }, debtorMaySettle = false, issuerMaySettle = false })
     t.Check('unsettleable type rejected', not unsettleable.ok)
+    local organization = ContractsTypes.Normalize({ typeKey = 'smoke_type', label = 'x',
+        issuerTypes = { 'organization' }, creditorTypes = { 'organization' }, debtorTypes = { 'organization' } })
     if Config.Settlement.creditorTypes.organization ~= true then
-        local organization = ContractsTypes.Normalize({ typeKey = 'smoke_type', label = 'x',
-            issuerTypes = { 'organization' }, creditorTypes = { 'organization' } })
         t.Check('organization creditor gated', not organization.ok
             and organization.code == 'creditor_type_unsupported')
+    else
+        t.Check('organization parties allowed', organization.ok)
     end
     local untrusted = ContractsTypes.Register(base, 'untrusted-smoke-resource')
     t.Check('untrusted issuer rejected', not untrusted.ok and untrusted.code == 'authorization_denied')
@@ -127,7 +129,8 @@ RegisterCommand('ContractsReleaseSmokeTest', function(source)
     t.Check('development disabled', Config.DevMode == false)
     t.Check('policy enabled', Config.Authorization.enabled == true)
     t.Check('self not trusted issuer', Config.Access.trustedIssuers[resourceName] ~= true)
-    t.Check('development commands absent', callable and registered.ContractsLiveTest ~= true)
+    t.Check('development commands absent', callable and registered.ContractsLiveTest ~= true
+        and registered.ContractsOrganizationTest ~= true)
     t.Check('reconcile command available', registered.ContractsReconcile == true)
     t.Done('(read-only)')
 end, true)
@@ -232,25 +235,26 @@ RegisterCommand('ContractsLiveTest', function(source, args)
         lostReady = lostReady.ok and ContractsObligations.AcceptObligation({ requestId = key('t-accept'),
             obligationId = lostId }, Actor(debtorId), resourceName, false) or lostReady
         if lostReady.ok then
+            -- The debtor's balance, read through Economy's exports (never its tables).
+            local function Balance()
+                local wallet = ContractsEconomy.ResolveDebtorAccount({ type = 'character', id = debtorId }, currency)
+                return wallet.ok and tonumber(wallet.value.balance) or nil
+            end
+            local before = Balance()
             ContractsEconomy.simulatedLostReplies = 1
             local lost = ContractsSettlement.SettleObligation({ requestId = key('t-settle'), obligationId = lostId },
                 Actor(debtorId), resourceName, false)
             ContractsEconomy.simulatedLostReplies = 0
-            local pendingRow = DB.one([[SELECT `settlement_id`,`economy_idempotency_key` FROM `contract_settlements`
+            local pendingRow = DB.one([[SELECT `settlement_id` FROM `contract_settlements`
                 WHERE `obligation_id`=? AND `status`='pending']], lostId)
-            local function Posted()
-                return pendingRow and tonumber(DB.value([[SELECT COUNT(*) FROM `economy_transactions`
-                    WHERE `source_resource`=? AND `idempotency_key`=? AND `status`='committed']],
-                    resourceName, pendingRow.economy_idempotency_key)) or -1
-            end
             t.Check('timeout leaves settlement pending', not lost.ok and lost.code == 'settlement_pending'
                 and pendingRow ~= nil)
-            t.Check('money moved during timeout', Posted() == 1)
+            t.Check('money moved during timeout', before ~= nil and Balance() == before - 1)
             ContractsSettlement.ProcessPending(Config.Scheduler.batchSize, true)
             local recovered = ContractsObligationRepository.Get(lostId)
             t.Check('replay settles after timeout', recovered.ok and recovered.value.status == 'settled'
                 and recovered.value.settlementState == 'none')
-            t.Check('no second transfer after timeout', Posted() == 1)
+            t.Check('no second transfer after timeout', before ~= nil and Balance() == before - 1)
         else
             t.Check('timeout obligation ready', false)
         end
@@ -316,4 +320,109 @@ RegisterCommand('ContractsLiveTest', function(source, args)
     t.Check('settlement integrity', audit.settledWithoutCommittedSettlement == 0
         and audit.committedSettlementNotSettled == 0 and audit.multipleCommitted == 0)
     t.Done(('run=%s'):format(runId))
+end, true)
+
+-- Development acceptance for organization parties. Nobody needs to be online.
+-- Uses an organization whose treasury is bound to an operator resource (for
+-- example a business run by a society resource). Moves 0.01 from the character
+-- into the treasury (organization creditor), then 0.01 from the treasury to the
+-- system sink (organization debtor), so the treasury ends where it started. The
+-- operator's own actions are run in its name through the service layer.
+--   ContractsOrganizationTest <character id|UUID> <organizationUuid> <fresh runId> [currency]
+RegisterCommand('ContractsOrganizationTest', function(source, args)
+    if source ~= 0 then return end
+    local function Character(value)
+        local src = tonumber(value)
+        if src then
+            local session = exports['feather-core']:GetSessionContext(src)
+            return type(session) == 'table' and session.ok and session.value.characterId:lower() or nil
+        end
+        return ContractsValidation.Uuid(value) and value:lower() or nil
+    end
+    local characterId = Character(args and args[1])
+    local organizationId = ContractsValidation.Uuid(args and args[2]) and args[2]:lower() or nil
+    local runId, currency = args and args[3], (args and args[4]) or 'dollars'
+    if not characterId or not organizationId or type(runId) ~= 'string'
+        or not runId:match('^[A-Za-z0-9][A-Za-z0-9_-]*$') or #runId > 40 then
+        print('[ContractsOrganizationTest] usage: ContractsOrganizationTest <character id|UUID> '
+            .. '<organizationUuid> <fresh runId> [currency]')
+        return
+    end
+    local operator = ContractsEconomy.TreasuryOperator(organizationId, currency)
+    if not operator then
+        return print('[ContractsOrganizationTest] the organization has no treasury bound to an operator resource')
+    end
+    local t = Runner('ContractsOrganizationTest')
+    local function key(suffix) return ('org-%s-%s'):format(runId, suffix) end
+    local function Treasury()
+        local accounts = exports['feather-economy']:FindAccountsByOwner({ ownerType = 'organization', ownerId = organizationId })
+        for _, account in ipairs(accounts.ok and accounts.value or {}) do
+            if account.accountType == 'treasury' and account.currency == currency then return account end
+        end
+    end
+    local function Actor(id) return { resource = resourceName, actorCharacterId = id } end
+    local function As(resource) return { resource = resource } end
+    print(('[ContractsOrganizationTest] organization %s, treasury operator %s'):format(organizationId, operator))
+
+    local typed = ContractsTypes.Register({ typeKey = 'contracts_smoke_org', label = 'Smoke organization bill',
+        requiresAcceptance = true, issuerMaySettle = true, issuerTypes = { 'system' },
+        creditorTypes = { 'character', 'organization', 'system' }, debtorTypes = { 'character', 'organization' } },
+        resourceName)
+    t.Check('organization type registered', typed.ok)
+    if not typed.ok then return t.Done() end
+    local treasury = Treasury()
+    local start = treasury and treasury.balance or 0
+
+    -- The organization is owed: a character pays into its treasury.
+    local owed = ContractsObligations.CreateDraft({ requestId = key('c-draft'), obligationType = 'contracts_smoke_org',
+        issuer = { type = 'system' }, debtor = { type = 'character', id = characterId },
+        creditor = { type = 'organization', id = organizationId }, amount = 1, currency = currency,
+        dueInSeconds = 3600 }, nil, resourceName)
+    local owedId = owed.ok and owed.value.obligationId
+    local owedIssued = owedId and ContractsObligations.IssueObligation({ requestId = key('c-issue'),
+        obligationId = owedId }, nil, resourceName) or owed
+    t.Check('creditor treasury frozen at issue', owedIssued.ok and treasury ~= nil
+        and owedIssued.value.creditorAccountId == treasury.accountId)
+    if not owedIssued.ok then
+        print(('[ContractsOrganizationTest] issue failed code=%s'):format(tostring(owedIssued.code)))
+        return t.Done()
+    end
+    local owedAccepted = ContractsObligations.AcceptObligation({ requestId = key('c-accept'), obligationId = owedId },
+        Actor(characterId), resourceName, false)
+    local paidIn = owedAccepted.ok and ContractsSettlement.SettleObligation({ requestId = key('c-settle'),
+        obligationId = owedId }, Actor(characterId), resourceName, false) or owedAccepted
+    local afterIn = Treasury()
+    t.Check('character paid the organization', paidIn.ok and paidIn.value.status == 'settled'
+        and afterIn ~= nil and afterIn.balance == start + 1)
+
+    -- The organization owes: only its treasury operator may act for it.
+    local owes = ContractsObligations.CreateDraft({ requestId = key('d-draft'), obligationType = 'contracts_smoke_org',
+        issuer = { type = 'system' }, debtor = { type = 'organization', id = organizationId },
+        creditor = { type = 'system' }, amount = 1, currency = currency, dueInSeconds = 3600 }, nil, resourceName)
+    local owesId = owes.ok and owes.value.obligationId
+    local owesIssued = owesId and ContractsObligations.IssueObligation({ requestId = key('d-issue'),
+        obligationId = owesId }, nil, resourceName) or owes
+    t.Check('organization debt issued', owesIssued.ok and owesIssued.value.status == 'issued')
+    local wrongAccept = owesIssued.ok and ContractsObligations.AcceptObligation({ requestId = key('d-accept-wrong'),
+        obligationId = owesId }, As(resourceName), resourceName, false) or owesIssued
+    t.Check('non-operator cannot accept for it', not wrongAccept.ok and wrongAccept.code == 'authorization_denied')
+    local accepted = owesIssued.ok and ContractsObligations.AcceptObligation({ requestId = key('d-accept'),
+        obligationId = owesId }, As(operator), operator, false) or owesIssued
+    t.Check('operator accepted for it', accepted.ok and accepted.value.status == 'accepted')
+    local issuerPays = accepted.ok and ContractsSettlement.SettleObligation({ requestId = key('d-settle-issuer'),
+        obligationId = owesId }, As(resourceName), resourceName, false) or accepted
+    t.Check('issuer cannot spend its treasury', not issuerPays.ok and issuerPays.code == 'settlement_not_allowed')
+    local paidOut = accepted.ok and ContractsSettlement.SettleObligation({ requestId = key('d-settle'),
+        obligationId = owesId }, As(operator), operator, false) or accepted
+    local afterOut = Treasury()
+    t.Check('operator paid from the treasury', paidOut.ok and paidOut.value.status == 'settled'
+        and afterOut ~= nil and afterOut.balance == start)
+
+    if ContractsEconomy.CanReadTransactions() then
+        ContractsSettlement.VerifyWithEconomy(Config.Settlement.verifyBatchSize)
+        t.Check('both settlements match economy journal', tonumber(DB.value([[SELECT COUNT(*)
+            FROM `contract_settlements` WHERE `obligation_id` IN (?,?) AND `status`='committed'
+            AND `economy_check`='verified']], owedId, owesId or owedId)) == 2)
+    end
+    t.Done(('run=%s treasury %s -> %s'):format(runId, tostring(start), tostring(afterOut and afterOut.balance)))
 end, true)

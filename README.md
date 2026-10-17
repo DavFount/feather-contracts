@@ -10,20 +10,16 @@ disputes, cancellations, and the audit trail. It does **not** own prices, tax
 policy, court gameplay, bank UI, debt-collection gameplay, or balances. Money
 moves only in Feather Economy. Contracts is not a quest or scripting engine.
 
-Status: implements phases C1–C3 of the
-[Contracts master plan](https://github.com/FeatherFramework/feather-framework-docs/blob/main/feather-contracts/Feather_Contracts_Master_Plan.md),
-plus C4: `bcc-housing` issues real property tax and rent obligations. Live
-acceptance passed on the development server on 2026-10-13.
+## Status
 
-| Gate | State |
-|---|---|
-| `ContractsFoundationSmokeTest` (17 checks) | Passed 17/17 on the server 2026-10-13 (again after migration 002) |
-| `ContractsAuditSmokeTest` (12 checks) | Passed 12/12 on the server 2026-10-13 |
-| `ContractsReleaseSmokeTest` (6 checks) | Passed 6/6 on the server 2026-10-13 |
-| `ContractsLiveTest` (DevMode, runs offline) | Passed 25/25 on the server 2026-10-13: idempotent settlement, no double payment, recovery after an Economy timeout, journal match, disputes, cancellation, due/default |
-| Real issuer (C4) | Passed 2026-10-13: a `bcc-housing` property tax (600 dollars, house 1) issued and collected through Contracts |
-| `ContractsReconcile` | Healthy 2026-10-13: 3 settlements, all verified against Economy's journal (needs feather-economy `GetTransaction`) |
-| Not yet exercised | Housing overdue and arrears path; `housing_rent` |
+Version 0.2.0, a pre-release of Feather Contract 1. It implements phases C1 to
+C4 of the
+[Contracts master plan](https://github.com/FeatherFramework/feather-framework-docs/blob/main/feather-contracts/Feather_Contracts_Master_Plan.md):
+types and drafts, settlement through Economy, the full lifecycle, and real
+obligation types from a housing integration (property tax and rent). The
+release, audit, live and organization tests pass; see [Validation](#validation).
+The public contract is in [CONTRACT.md](CONTRACT.md), proposed for freezing as
+Contract 1.
 
 ## Dependencies and start order
 
@@ -33,6 +29,13 @@ feather-core      (Contract 1)
 feather-economy   (Contract 1: currencyCatalog, accounts, transfers, idempotency)
 ```
 
+Optional Economy features, checked at startup or before use:
+
+| Feature | Economy version | Without it |
+|---|---|---|
+| `transactionRead` (`GetTransaction`) | 0.3.0 | Reconciliation checks only Contracts' own records |
+| `organizationSettlement` | 0.4.0 | Contracts does not start while organization parties are enabled in `Config.Settlement`; set them to `false` |
+
 Start Contracts after Economy and before the resources that issue obligations:
 
 ```cfg
@@ -41,7 +44,7 @@ ensure feather-economy
 # ... platform and governance resources ...
 ensure feather-contracts
 ensure feather-admin
-# obligation issuers (for example bcc-society, bcc-banks) after this
+# obligation issuers (for example a society or bank resource) after this
 ```
 
 Contracts waits for Core and Economy readiness and capabilities, then fails
@@ -56,7 +59,12 @@ so Economy must trust it. Add `feather-contracts` to these lists in
 ```lua
 trustedReaders      = { ['feather-contracts'] = true, ... }
 trustedTransactors  = { ['feather-contracts'] = true, ... }
+trustedSettlers     = { ['feather-contracts'] = true, ... }  -- organization parties
 ```
+
+Organization creditors and debtors need feather-economy with the
+`organizationSettlement` capability; Contracts checks it at startup while either
+is enabled in `Config.Settlement`.
 
 Contracts is never a provisioner, reverser, or supplier: it cannot create
 wallets or currency.
@@ -68,7 +76,7 @@ each issuer explicitly in `feather-admin/configs/service_policy.lua`:
 
 ```lua
 Config.servicePolicy['feather-contracts'] = {
-    ['bcc-society'] = {
+    ['my-society'] = {
         ['contracts.obligation.issue'] = true,
         ['contracts.obligation.cancel'] = true,
         ['contracts.obligation.default'] = true
@@ -94,6 +102,7 @@ obligations that already exist: each obligation snapshots its lifecycle flags.
 | `label` | required | Display label (not an identifier) |
 | `issuerTypes` | required | Allowed issuer parties: `character`, `organization`, `system` |
 | `creditorTypes` | required | Allowed creditor parties (must be enabled in `Config.Settlement.creditorTypes`) |
+| `debtorTypes` | `{ 'character' }` | Allowed debtor parties: `character`, `organization` (must be enabled in `Config.Settlement.debtorTypes`) |
 | `requiresAcceptance` | `false` | Debtor must accept before the obligation can be paid or fall due |
 | `debtorMaySettle` | `true` | Debtor may pay it (client route or owner with `actorSource`) |
 | `issuerMaySettle` | `false` | The owning resource may collect from the debtor's wallet without the debtor acting |
@@ -103,12 +112,17 @@ obligations that already exist: each obligation snapshots its lifecycle flags.
 | `maximumDueSeconds` | config limit | Longest allowed due period |
 | `defaultAfterSeconds` | none | When set, a due obligation defaults automatically this long after its due date |
 
-**Parties.** In v1 the debtor is always a character. Creditors can be a
-character (paid into their wallet) or the system (paid into Economy's system
-sink, for example fines and taxes). Organization creditors are modelled but
-disabled: Feather Economy currently allows wallet-to-treasury transfers only
-for shop purchases, and Contracts refuses to issue an obligation it could
-never settle.
+**Parties.** The debtor is a character (paying from their wallet) or an
+organization (paying from its treasury). Creditors can be a character (paid
+into their wallet), an organization (paid into its treasury) or the system
+(paid into Economy's system sink, for example fines and taxes). The creditor
+account is frozen at issuance.
+
+An organization debtor acts through the resource its treasury is bound to in
+Economy (operated accounts): only that resource may accept, dispute or pay its
+obligations, and no client route acts for it. The issuing resource cannot
+spend an organization's treasury, even with `issuerMaySettle`; Economy enforces
+the same rule on the transfer.
 
 **Lifecycle.**
 
@@ -175,14 +189,14 @@ local issued = contracts:IssueObligation({
 | `GetObligationType({ typeKey })` | any | Definition, owner, `active`, `transitions` |
 | `CreateDraft(request, context?)` | type owner | Validates parties, amount, currency, due period |
 | `IssueObligation({ requestId, obligationId, reasonCode?, expectedRevision? }, context?)` | type owner | Policy `contracts.obligation.issue`; freezes creditor account; sets `due_at` |
-| `AcceptObligation({ requestId, obligationId }, { actorSource })` | type owner | Actor must be the debtor |
-| `DisputeObligation({ requestId, obligationId, reasonCode }, { actorSource })` | type owner | Actor must be the debtor; type must allow disputes |
+| `AcceptObligation({ requestId, obligationId }, { actorSource })` | type owner; for an organization debtor, the resource operating its treasury | A character debtor must be the actor |
+| `DisputeObligation({ requestId, obligationId, reasonCode }, { actorSource })` | as for accept | Type must allow disputes |
 | `ResolveDispute({ requestId, obligationId, outcome, reasonCode, expectedRevision? }, context?)` | type owner | `upheld` or `cancelled` (policy `contracts.obligation.cancel`) |
-| `SettleObligation({ requestId, obligationId }, context?)` | type owner | Debtor-initiated with `actorSource` = debtor, otherwise requires `issuerMaySettle` |
+| `SettleObligation({ requestId, obligationId }, context?)` | type owner; for an organization debtor, only the resource operating its treasury | Debtor-initiated with `actorSource` = debtor, otherwise requires `issuerMaySettle` |
 | `CancelObligation({ requestId, obligationId, reasonCode, expectedRevision? }, context?)` | type owner | Policy `contracts.obligation.cancel` |
 | `MarkDefaulted({ requestId, obligationId, reasonCode, expectedRevision? }, context?)` | type owner | Policy `contracts.obligation.default`; from `due` only |
 | `GetObligation({ obligationId })` | owner, issuer, trusted reader | Others receive `obligation_not_found` |
-| `ListPartyObligations({ party, role?, statuses?, obligationType?, limit?, cursor? })` | trusted reader, or owner filtering its own type | Cursor-paginated, newest first |
+| `ListPartyObligations({ party, role?, statuses?, obligationType?, limit?, cursor? })` | trusted reader, owner filtering its own type, or the resource operating the organization party's treasury | Cursor-paginated, newest first |
 | `ReconcileSettlements()` | trusted reconciler | Replays pending settlements, checks committed ones against Economy's journal, and returns the integrity audit |
 
 Amounts are integers in the currency's minor units (2500 = 25.00 dollars).
@@ -330,14 +344,24 @@ evidence. Issuance requires a policy grant for feather-contracts itself while
 policy is enabled. Disable DevMode, remove that grant and restart before
 release.
 
+Organization parties, also with nobody online:
+
+```text
+ContractsOrganizationTest <character id|UUID> <organizationUuid> <fresh runId> [currency]
+```
+
+The organization's treasury must be bound to an operator resource in Economy.
+A character pays 0.01 into the treasury (organization creditor, frozen treasury
+account); then the organization owes 0.01 to the system: a non-operator cannot
+accept for it, its operator accepts, the issuer cannot spend the treasury, and
+the operator pays. The treasury ends at its starting balance, and both
+settlements must match Economy's journal. The operator's actions run in its
+name through the service layer.
+
 ## Known limits
 
-- Organization creditors and debtors need an Economy contract addition
-  (wallet-to-treasury and treasury-debit transfers for `contracts.settlement`).
-- No amendment workflow (`amendments = 0` in capabilities).
-- The Economy journal check needs `GetTransaction` in feather-economy. Without
-  it, reconciliation reports the journal as unavailable and checks only
-  Contracts' own records.
+- No amendment workflow (`amendments = 0` in capabilities): cancel and issue
+  a new obligation instead.
 - Settlement replay after Economy is permanently unavailable keeps the
   settlement pending indefinitely; `settlement.stuck` is logged after
   `Config.Settlement.maximumAttempts`.

@@ -6,7 +6,7 @@ lua54 'yes'
 description 'Authoritative payable obligations for the Feather Framework'
 author 'Feather Framework'
 name 'feather-contracts'
-version '0.1.0'
+version '0.2.0'
 
 shared_script 'shared/results.lua'
 
@@ -16,6 +16,7 @@ server_scripts {
     'server/logging.lua',
     'server/migrations/001_contracts_foundation.lua',
     'server/migrations/002_settlement_economy_check.lua',
+    'server/migrations/003_organization_debtors.lua',
     'server/persistence/migrations.lua',
     'server/services/foundation.lua',
     'server/services/validation.lua',

@@ -77,8 +77,31 @@ function ContractsEconomy.ResolveCreditorAccount(creditorType, creditorId, curre
     return Err('invalid_input', 'Unsupported creditor type.')
 end
 
-function ContractsEconomy.ResolveDebtorWallet(characterId, currency)
-    return FindOwnerAccount('character', characterId, 'wallet', currency)
+-- The account a debtor pays from: a character's wallet or an organization's treasury.
+function ContractsEconomy.ResolveDebtorAccount(debtor, currency)
+    if debtor.type == 'organization' then
+        return FindOwnerAccount('organization', debtor.id, 'treasury', currency)
+    end
+    return FindOwnerAccount('character', debtor.id, 'wallet', currency)
+end
+
+-- The resource an organization's treasury is bound to, or nil. Only that resource
+-- may act for the organization as a debtor (accept, dispute, pay).
+function ContractsEconomy.TreasuryOperator(organizationId, currency)
+    local treasury = FindOwnerAccount('organization', organizationId, 'treasury', currency)
+    return treasury.ok and treasury.value.operatorResource or nil
+end
+
+-- The resource an organization's treasuries are bound to (the binding is per
+-- organization, not per currency), or nil.
+function ContractsEconomy.OrganizationOperator(organizationId)
+    local accounts = Call('FindAccountsByOwner', { ownerType = 'organization', ownerId = organizationId })
+    for _, account in ipairs(accounts.ok and type(accounts.value) == 'table' and accounts.value or {}) do
+        if account.accountType == 'treasury' and type(account.operatorResource) == 'string' then
+            return account.operatorResource
+        end
+    end
+    return nil
 end
 
 -- DevMode acceptance only: the next N transfers post in Economy but their reply
@@ -99,7 +122,9 @@ function ContractsEconomy.Settle(settlement)
     }, {
         actorAccountId = settlement.actor_account_id,
         actorCharacterId = settlement.actor_character_id,
-        correlationId = settlement.correlation_id
+        correlationId = settlement.correlation_id,
+        -- Economy lets an organization treasury pay only for the resource operating it.
+        onBehalfOf = settlement.source_resource
     })
     if Config.DevMode and ContractsEconomy.simulatedLostReplies > 0 then
         ContractsEconomy.simulatedLostReplies = ContractsEconomy.simulatedLostReplies - 1
